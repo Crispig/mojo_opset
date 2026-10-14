@@ -19,12 +19,15 @@ from .fused_quantization import residual_add_layer_norm_quant
 from .fused_quantization import residual_add_rms_norm_quant
 from .fused_quantization import rms_norm_quant
 from .gelu import gelu
+from .gemm import batch_invariant_linear
+from .gemm import batch_invariant_matmul
 from .gemm import group_gemm
 from .gemm import quant_batch_gemm_reduce_sum
 from .gemm import quant_gemm
 from .indexer import indexer
 from .indexer import lightning_indexer
 from .kv_cache import store_paged_kv_cache
+from .logprobs import logprobs_from_logits
 from .multimodal_rope_infer import multimodal_rope_infer
 from .normalization import group_rms_norm_infer
 from .normalization import layer_norm_infer
@@ -45,6 +48,9 @@ from .position_embedding import vision_rope_2d_infer
 from .quantization import dequant
 from .quantization import dynamic_quant
 from .quantization import static_quant
+from .reduction import amax
+from .reduction import mean
+from .reduction import reduce_sum
 from .rms_norm import rms_norm
 from .rope import rope
 from .rope_cos_sin import rope_cos_sin
@@ -59,10 +65,20 @@ from .sampling import top_p_sampling
 from .sdpa import diffusion_attention
 from .sdpa import sdpa_infer
 from .silu import silu
+from .softmax import log_softmax
+from .softmax import softmax
 from .store_lowrank import store_lowrank
 from .swiglu import swiglu
 
 __all__ = [
+    "amax",
+    "batch_invariant_linear",
+    "log_softmax",
+    "logprobs_from_logits",
+    "batch_invariant_matmul",
+    "mean",
+    "reduce_sum",
+    "softmax",
     "apply_penalties_temperature",
     "causal_conv1d",
     "causal_conv1d_update_state_infer",

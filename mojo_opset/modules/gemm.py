@@ -65,3 +65,14 @@ class QuantBatchGemmReduceSum(torch.nn.Module):
             trans_weight=self.trans_weight,
             implementation=self.implementation,
         )
+
+
+class BatchInvariantGemm(torch.nn.Linear):
+    """Batch-invariant GEMM with nn.Linear-compatible parameters and state dict."""
+
+    def __init__(self, in_features, out_features, bias=True, device=None, dtype=None, *, implementation=None):
+        super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
+        self.implementation = implementation
+
+    def forward(self, input):
+        return functions.batch_invariant_linear(input, self.weight, self.bias, implementation=self.implementation)

@@ -1,6 +1,8 @@
-"""Forward-only grouped and quantized GEMMs from the original Mojo operators."""
+"""Grouped/quantized inference GEMMs and trainable batch-invariant GEMMs."""
 
 import torch
+
+from torch.autograd.function import once_differentiable
 
 from ._checks import _require_inference
 from ._dispatch import load_impl
@@ -44,3 +46,36 @@ def quant_batch_gemm_reduce_sum(input, weight, x1_scale, x2_scale, *, trans_weig
     _require_inference("quant_batch_gemm_reduce_sum", x1_scale, x2_scale)
     forward, _ = load_impl("quant_batch_gemm_reduce_sum", implementation)
     return forward(input, weight, x1_scale, x2_scale, trans_weight)
+
+
+class BatchInvariantGemmFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias, implementation, op_id):
+        forward, backward = load_impl(op_id, implementation, require_backward=True)
+        ctx.backward_kernel = backward
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(input, weight)
+        return forward(input, weight, bias)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        input, weight = ctx.saved_tensors
+        grad_input, grad_weight, grad_bias = ctx.backward_kernel(
+            grad_output,
+            input,
+            weight,
+            ctx.has_bias,
+            ctx.needs_input_grad[:3],
+        )
+        return grad_input, grad_weight, grad_bias, None, None
+
+
+def batch_invariant_matmul(a, b, bias=None, *, implementation=None):
+    """Compute [M,K] @ [K,N] + optional bias with batch-independent K reduction."""
+    return BatchInvariantGemmFunction.apply(a, b, bias, implementation, "batch_invariant_matmul")
+
+
+def batch_invariant_linear(input, weight, bias=None, *, implementation=None):
+    """Compute input[...,K] @ weight[N,K].T + bias using the same GEMM kernel."""
+    return BatchInvariantGemmFunction.apply(input, weight, bias, implementation, "batch_invariant_linear")

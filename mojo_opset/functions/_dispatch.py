@@ -11,6 +11,7 @@ from mojo_opset.utils.target import TargetLike
 from mojo_opset.utils.target import detect_target
 
 _PROVIDERS = {
+    ("npu.a2", "batch_invariant"): "mojo_opset.kernels.npu_a2_batch_invariant",
     ("npu.a2", "triton"): "mojo_opset.kernels.npu_a2_triton",
     ("npu.a5", "triton"): "mojo_opset.kernels.npu_a5_triton",
     ("npu.a2", "torch_npu"): "mojo_opset.kernels.npu_torch_npu",
