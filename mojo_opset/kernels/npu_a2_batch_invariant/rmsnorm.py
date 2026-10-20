@@ -12,6 +12,7 @@ from .utils import require_deterministic_mode
 # matches VeXact's GPU RMSNorm tile, so adding or removing unrelated rows never
 # changes a row's floating-point reduction tree.
 _REDUCTION_BLOCK_SIZE = 1024
+_ROWS_PER_PROGRAM = 8
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
@@ -28,32 +29,75 @@ def _rmsnorm_fwd_kernel(
     n_cols,
     eps,
     BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_PROGRAM: tl.constexpr,
+    SINGLE_BLOCK: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     num_programs = tl.num_programs(0)
+    if SINGLE_BLOCK:
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        col_mask = col_offsets < n_cols
+        cached_weight = tl.load(weight_ptr + col_offsets, mask=col_mask, other=1.0).to(tl.float32)
 
-    for row_idx in range(program_id, n_rows, num_programs):
-        row_idx_i64 = row_idx.to(tl.int64)
-        input_row = input_ptr + row_idx_i64 * input_row_stride
-        output_row = output_ptr + row_idx_i64 * output_row_stride
+    # Vectorize independent rows without changing any row's 1024-wide tree.
+    row_tasks = tl.cdiv(n_rows, ROWS_PER_PROGRAM)
+    for row_task in range(program_id, row_tasks, num_programs):
+        row_idx = (row_task * ROWS_PER_PROGRAM + tl.arange(0, ROWS_PER_PROGRAM)).to(tl.int64)
+        row_mask = row_idx < n_rows
+        input_row = input_ptr + row_idx * input_row_stride
+        output_row = output_ptr + row_idx * output_row_stride
 
-        sum_squares = tl.zeros((1,), dtype=tl.float32)
-        for col_start in range(0, n_cols, BLOCK_SIZE):
-            col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-            col_mask = col_offsets < n_cols
-            values = tl.load(input_row + col_offsets, mask=col_mask, other=0.0).to(tl.float32)
-            sum_squares += tl.sum(tl.where(col_mask, values * values, 0.0))
+        sum_squares = tl.zeros((ROWS_PER_PROGRAM,), dtype=tl.float32)
+        if SINGLE_BLOCK:
+            cached_values = tl.load(
+                input_row[:, None] + col_offsets[None, :],
+                mask=row_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            sum_squares += tl.sum(tl.where(col_mask[None, :], cached_values * cached_values, 0.0), axis=1)
+        else:
+            for col_start in range(0, n_cols, BLOCK_SIZE):
+                col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+                col_mask = col_offsets < n_cols
+                values = tl.load(
+                    input_row[:, None] + col_offsets[None, :],
+                    mask=row_mask[:, None] & col_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                sum_squares += tl.sum(tl.where(col_mask[None, :], values * values, 0.0), axis=1)
 
-        reciprocal_rms = 1.0 / tl.sqrt(sum_squares / n_cols + eps)
-        tl.store(rstd_ptr + row_idx_i64 + tl.arange(0, 1), reciprocal_rms)
+        # Ascend scalar and vector sqrt/div lower differently by up to one ULP.
+        # Keep the original one-element path before broadcasting across rows.
+        reciprocal_rms = tl.full((ROWS_PER_PROGRAM,), 0.0, dtype=tl.float32)
+        for row in tl.static_range(ROWS_PER_PROGRAM):
+            row_sum = tl.gather(sum_squares, tl.full((1,), row, tl.int32), axis=0)
+            row_reciprocal = 1.0 / tl.sqrt(row_sum / n_cols + eps)
+            reciprocal_rms = tl.where(tl.arange(0, ROWS_PER_PROGRAM) == row, row_reciprocal, reciprocal_rms)
+        tl.store(rstd_ptr + row_idx, reciprocal_rms, mask=row_mask)
 
-        for col_start in range(0, n_cols, BLOCK_SIZE):
-            col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
-            col_mask = col_offsets < n_cols
-            values = tl.load(input_row + col_offsets, mask=col_mask, other=0.0).to(tl.float32)
-            weight = tl.load(weight_ptr + col_offsets, mask=col_mask, other=1.0).to(tl.float32)
-            output = values * reciprocal_rms * weight
-            tl.store(output_row + col_offsets, output, mask=col_mask)
+        if SINGLE_BLOCK:
+            output = cached_values * reciprocal_rms[:, None] * cached_weight[None, :]
+            tl.store(
+                output_row[:, None] + col_offsets[None, :],
+                output,
+                mask=row_mask[:, None] & col_mask[None, :],
+            )
+        else:
+            for col_start in range(0, n_cols, BLOCK_SIZE):
+                col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+                col_mask = col_offsets < n_cols
+                values = tl.load(
+                    input_row[:, None] + col_offsets[None, :],
+                    mask=row_mask[:, None] & col_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                weight = tl.load(weight_ptr + col_offsets, mask=col_mask, other=1.0).to(tl.float32)
+                output = values * reciprocal_rms[:, None] * weight[None, :]
+                tl.store(
+                    output_row[:, None] + col_offsets[None, :],
+                    output,
+                    mask=row_mask[:, None] & col_mask[None, :],
+                )
 
 
 @libentry()
@@ -223,6 +267,8 @@ def rmsnorm_fwd(
         return output_2d.reshape(original_shape), rstd
 
     num_programs = get_num_cores("vector")
+    # R packs independent rows; only the fixed 1024-column tree affects their reductions.
+    rows_per_program = min(_ROWS_PER_PROGRAM, 1 << max(0, (n_rows // num_programs).bit_length() - 1))
     _rmsnorm_fwd_kernel[(num_programs,)](
         input_2d,
         weight_contiguous,
@@ -234,6 +280,8 @@ def rmsnorm_fwd(
         n_cols,
         eps,
         BLOCK_SIZE=_REDUCTION_BLOCK_SIZE,
+        ROWS_PER_PROGRAM=rows_per_program,
+        SINGLE_BLOCK=n_cols <= _REDUCTION_BLOCK_SIZE,
     )
     return output_2d.reshape(original_shape), rstd
 

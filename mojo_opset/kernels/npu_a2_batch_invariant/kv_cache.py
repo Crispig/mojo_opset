@@ -5,12 +5,128 @@ import triton
 import triton.language as tl
 
 from mojo_opset.utils.kv_cache_metadata import assert_paged_kv_store_contract
-from mojo_opset.utils.kv_cache_metadata import build_paged_kv_chunk_metadata
 
+from .utils import get_num_cores
 from .utils import libentry
 from .utils import require_deterministic_mode
 
 _COPY_BLOCK_SIZE = 256
+
+
+@triton.jit
+def _store_paged_chunks_kernel(
+    key,
+    value,
+    key_cache,
+    value_cache,
+    chunks,
+    stride_cm_row,
+    stride_cm_col,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_kb,
+    stride_kch,
+    stride_kp,
+    stride_kcd,
+    stride_vb,
+    stride_vch,
+    stride_vp,
+    stride_vcd,
+    NUM_CHUNKS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    KEY_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    dims = tl.arange(0, BLOCK_D)
+    for task in range(tl.program_id(0), NUM_CHUNKS * NUM_HEADS, tl.num_programs(0)):
+        chunk = chunks + task // NUM_HEADS * stride_cm_row
+        head = task % NUM_HEADS
+        first = tl.load(chunk).to(tl.int64)
+        block = tl.load(chunk + stride_cm_col).to(tl.int64)
+        offset = tl.load(chunk + 2 * stride_cm_col)
+        length = tl.load(chunk + 3 * stride_cm_col)
+        if block >= 0:
+            for start in range(0, length, BLOCK_T):
+                positions = start + tl.arange(0, BLOCK_T)
+                tokens = first + positions
+                destination = offset + positions
+                k_mask = (positions[:, None] < length) & (dims[None, :] < KEY_DIM)
+                k_values = tl.load(
+                    key + tokens[:, None] * stride_kt + head * stride_kh + dims[None, :] * stride_kd,
+                    mask=k_mask,
+                    other=0.0,
+                )
+                tl.store(
+                    key_cache
+                    + block * stride_kb
+                    + head * stride_kch
+                    + destination[:, None] * stride_kp
+                    + dims[None, :] * stride_kcd,
+                    k_values,
+                    mask=k_mask,
+                )
+                v_mask = (positions[:, None] < length) & (dims[None, :] < VALUE_DIM)
+                v_values = tl.load(
+                    value + tokens[:, None] * stride_vt + head * stride_vh + dims[None, :] * stride_vd,
+                    mask=v_mask,
+                    other=0.0,
+                )
+                tl.store(
+                    value_cache
+                    + block * stride_vb
+                    + head * stride_vch
+                    + destination[:, None] * stride_vp
+                    + dims[None, :] * stride_vcd,
+                    v_values,
+                    mask=v_mask,
+                )
+
+
+@triton.jit
+def _chunks_from_blocks_kernel(
+    block_table,
+    cumulative_lengths,
+    context_lengths,
+    chunks,
+    stride_batch,
+    stride_page,
+    NUM_PAGES: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    IS_DECODE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if IS_DECODE:
+        batch = row
+        first = batch
+        context = tl.load(context_lengths + batch)
+        page = context // PAGE_SIZE
+        valid = (context >= 0) & (page >= 0) & (page < NUM_PAGES)
+        physical = tl.load(block_table + batch * stride_batch + page * stride_page, mask=valid, other=-1)
+        source_start = first
+        offset = context % PAGE_SIZE
+        length = tl.where(valid & (physical >= 0), 1, 0)
+    else:
+        batch = row // NUM_PAGES
+        page = row % NUM_PAGES
+        first = tl.load(cumulative_lengths + batch)
+        last = tl.load(cumulative_lengths + batch + 1)
+        context = tl.load(context_lengths + batch)
+        start = tl.maximum(context, page * PAGE_SIZE)
+        end = tl.minimum(context + last - first, (page + 1) * PAGE_SIZE)
+        physical = tl.load(block_table + batch * stride_batch + page * stride_page)
+        source_start = first + start - context
+        offset = start - page * PAGE_SIZE
+        length = tl.where((context >= 0) & (physical >= 0), tl.maximum(end - start, 0), 0)
+    tl.store(chunks + row * 4, source_start)
+    tl.store(chunks + row * 4 + 1, physical)
+    tl.store(chunks + row * 4 + 2, offset)
+    tl.store(chunks + row * 4 + 3, length)
 
 
 @libentry()
@@ -178,18 +294,83 @@ def _store_cache_slots(
 def store_paged_kv_cache_fwd(
     key_states, value_states, key_cache, value_cache, block_table, cu_q_lens, context_kv_lens, chunk_metadata
 ):
-    if chunk_metadata is None:
+    """Write caller-validated cache metadata without reading device contents on the host."""
+
+    require_deterministic_mode()
+    if key_states.shape[:2] != value_states.shape[:2]:
+        raise ValueError("key and value must have matching token/head dimensions")
+    for source, cache in ((key_states, key_cache), (value_states, value_cache)):
+        if source.ndim != 3 or cache.ndim != 4:
+            raise ValueError("source/cache must have shape [tokens, heads, dim]/[pages, heads, page, dim]")
+        if cache.shape[1] != source.shape[1] or cache.shape[3] != source.shape[2]:
+            raise ValueError("source/cache head shape mismatch")
+        if source.device != key_states.device or cache.device != key_states.device:
+            raise ValueError("source, cache, and metadata must be on the same device")
+        if source.dtype != cache.dtype:
+            raise TypeError("source and cache must use the same dtype")
+    if key_cache.shape[:3] != value_cache.shape[:3]:
+        raise ValueError("key/value caches must have matching page/head dimensions")
+    if not key_states.shape[0]:
+        return key_cache, value_cache
+    page_size = key_cache.shape[2]
+    if chunk_metadata is not None:
+        assert_paged_kv_store_contract(chunk_metadata)
+        if chunk_metadata.device != key_states.device:
+            raise ValueError("chunk_metadata and key_states must be on the same device")
+    else:
         if block_table is None or context_kv_lens is None:
             raise ValueError("block_table and context_kv_lens are required")
-        chunk_metadata = build_paged_kv_chunk_metadata(block_table, cu_q_lens, context_kv_lens, key_cache.shape[2])
-    assert_paged_kv_store_contract(chunk_metadata)
-    slots = torch.full((key_states.shape[0],), -1, dtype=torch.int64, device=key_states.device)
-    for source_start, block_id, block_offset, chunk_len in chunk_metadata.cpu().tolist():
-        start = block_id * key_cache.shape[2] + block_offset
-        slots[source_start : source_start + chunk_len] = torch.arange(
-            start, start + chunk_len, dtype=torch.int64, device=key_states.device
+        if block_table.dtype != torch.int32 or block_table.ndim != 2:
+            raise ValueError("block_table must have shape [batch, pages] and use int32")
+        if context_kv_lens.dtype != torch.int32 or context_kv_lens.shape != (block_table.shape[0],):
+            raise ValueError("context_kv_lens must have shape [batch] and use int32")
+        if block_table.device != key_states.device or context_kv_lens.device != key_states.device:
+            raise ValueError("cache metadata and key_states must be on the same device")
+        if context_kv_lens.stride(0) != 1:
+            raise ValueError("context_kv_lens must be contiguous")
+        if cu_q_lens is not None:
+            if cu_q_lens.dtype != torch.int32 or cu_q_lens.shape != (block_table.shape[0] + 1,):
+                raise ValueError("cu_q_lens must have shape [batch + 1] and use int32")
+            if cu_q_lens.device != key_states.device or cu_q_lens.stride(0) != 1:
+                raise ValueError("cu_q_lens must be contiguous and on the same device as key_states")
+        elif key_states.shape[0] != block_table.shape[0]:
+            raise ValueError("decode requires one source token per sequence")
+        chunk_count = block_table.shape[0] * (1 if cu_q_lens is None else block_table.shape[1])
+        chunk_metadata = torch.empty((chunk_count, 4), device=key_states.device, dtype=torch.int32)
+        if chunk_count:
+            _chunks_from_blocks_kernel[(chunk_count,)](
+                block_table,
+                cu_q_lens,
+                context_kv_lens,
+                chunk_metadata,
+                block_table.stride(0),
+                block_table.stride(1),
+                NUM_PAGES=block_table.shape[1],
+                PAGE_SIZE=page_size,
+                IS_DECODE=cu_q_lens is None,
+            )
+    tasks = chunk_metadata.shape[0] * key_states.shape[1]
+    if tasks:
+        _store_paged_chunks_kernel[(min(tasks, get_num_cores("vector")),)](
+            key_states,
+            value_states,
+            key_cache,
+            value_cache,
+            chunk_metadata,
+            chunk_metadata.stride(0),
+            chunk_metadata.stride(1),
+            *key_states.stride(),
+            *value_states.stride(),
+            *key_cache.stride(),
+            *value_cache.stride(),
+            NUM_CHUNKS=chunk_metadata.shape[0],
+            NUM_HEADS=key_states.shape[1],
+            KEY_DIM=key_states.shape[2],
+            VALUE_DIM=value_states.shape[2],
+            BLOCK_T=64,
+            BLOCK_D=triton.next_power_of_2(max(key_states.shape[2], value_states.shape[2])),
+            multibuffer=False,
         )
-    _store_cache_slots(key_states, value_states, key_cache, value_cache, slots, layout="blocks_heads_page_dim")
     return key_cache, value_cache
 
 

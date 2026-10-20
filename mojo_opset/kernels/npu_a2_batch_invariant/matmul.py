@@ -40,7 +40,7 @@ _A2_TILE_TABLE = {
     torch.bfloat16: {
         "small_kn": _TileConfig(64, 64, 32),
         "small_n": _TileConfig(64, 64, 64),
-        "default": _TileConfig(64, 128, 64),
+        "default": _TileConfig(128, 256, 64),
     },
     torch.float32: {
         "small_kn": _TileConfig(32, 32, 16),

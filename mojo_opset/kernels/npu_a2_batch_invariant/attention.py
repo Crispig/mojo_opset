@@ -50,6 +50,7 @@ def _attention_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    GROUPED_DECODE: tl.constexpr = False,
 ):
     """Causal packed/paged forward with an identical logical reduction chain."""
 
@@ -68,27 +69,39 @@ def _attention_fwd_kernel(
         k_end = tl.load(cu_k_lens_ptr + batch_id + 1).to(tl.int32)
         kv_len = k_end - k_start
 
-    # Anchor the query tile to its absolute position in the logical KV stream.
-    # A decode token therefore occupies the same matrix row as it did in the
-    # packed training/prefill call, instead of switching to a q_len=1 kernel.
+    # Prefill tiles are anchored to absolute KV positions. Grouped decode packs
+    # independent heads into the same Cube tile, retaining absolute causal
+    # positions and the original per-head QK/PV reduction shapes and KV chain.
     q_abs_start = kv_len - q_len
     first_q_block = q_abs_start // BLOCK_M
     q_block_count = tl.cdiv(kv_len, BLOCK_M) - first_q_block
-    task_count = q_block_count * NUM_Q_HEADS
+    if GROUPED_DECODE:
+        tl.static_assert(PAGED and NUM_Q_HEADS // NUM_KV_HEADS <= BLOCK_M)
+        task_count = tl.where(kv_len > 0, NUM_KV_HEADS, 0)
+    else:
+        task_count = q_block_count * NUM_Q_HEADS
 
     offs_d = tl.arange(0, BLOCK_D)
     qk_scale = softmax_scale * 1.4426950408889634
 
     for task_id in range(core_id, task_count, core_count):
-        q_block_id = first_q_block + task_id // NUM_Q_HEADS
-        q_head_id = task_id % NUM_Q_HEADS
-        kv_head_id = q_head_id // (NUM_Q_HEADS // NUM_KV_HEADS)
-
-        offs_m = q_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
-        valid_q = (offs_m >= q_abs_start) & (offs_m < kv_len)
-        q_local = tl.where(valid_q, offs_m - q_abs_start, 0)
-        q_token = (q_start + q_local).to(tl.int64)
-        q_ptrs = q_ptr + q_token[:, None] * stride_qt + q_head_id * stride_qh + offs_d[None, :] * stride_qd
+        if GROUPED_DECODE:
+            kv_head_id = task_id
+            q_heads = kv_head_id * (NUM_Q_HEADS // NUM_KV_HEADS) + tl.arange(0, BLOCK_M)
+            offs_m = tl.zeros((BLOCK_M,), tl.int32) + q_abs_start
+            valid_q = tl.arange(0, BLOCK_M) < NUM_Q_HEADS // NUM_KV_HEADS
+            q_ptrs = (
+                q_ptr + q_start.to(tl.int64) * stride_qt + q_heads[:, None] * stride_qh + offs_d[None, :] * stride_qd
+            )
+        else:
+            q_block_id = first_q_block + task_id // NUM_Q_HEADS
+            q_head_id = task_id % NUM_Q_HEADS
+            kv_head_id = q_head_id // (NUM_Q_HEADS // NUM_KV_HEADS)
+            offs_m = q_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+            valid_q = (offs_m >= q_abs_start) & (offs_m < kv_len)
+            q_local = tl.where(valid_q, offs_m - q_abs_start, 0)
+            q_token = (q_start + q_local).to(tl.int64)
+            q_ptrs = q_ptr + q_token[:, None] * stride_qt + q_head_id * stride_qh + offs_d[None, :] * stride_qd
         q = tl.load(
             q_ptrs,
             mask=valid_q[:, None] & (offs_d[None, :] < HEAD_DIM),
@@ -102,38 +115,46 @@ def _attention_fwd_kernel(
         for kv_block_id in range(0, tl.cdiv(kv_len, BLOCK_N)):
             offs_n = kv_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
             valid_n = offs_n < kv_len
-            safe_n = tl.where(valid_n, offs_n, 0)
 
             if PAGED:
-                logical_page = safe_n // PAGE_SIZE
-                page_offset = safe_n - logical_page * PAGE_SIZE
+                tl.static_assert(PAGE_SIZE % BLOCK_N == 0)
+                logical_page = kv_block_id * BLOCK_N // PAGE_SIZE
+                page_offset = kv_block_id * BLOCK_N % PAGE_SIZE
                 physical_page = tl.load(
                     page_table_ptr + batch_id * stride_ptb + logical_page * stride_ptp,
-                    mask=valid_n,
-                    other=0,
                 ).to(tl.int64)
-                k_ptrs = (
-                    k_ptr
-                    + physical_page[:, None] * stride_kt
-                    + kv_head_id * stride_kh
-                    + page_offset[:, None] * stride_kp
-                    + offs_d[None, :] * stride_kd
-                )
-                v_ptrs = (
-                    v_ptr
-                    + physical_page[:, None] * stride_vt
-                    + kv_head_id * stride_vh
-                    + page_offset[:, None] * stride_vp
-                    + offs_d[None, :] * stride_vd
-                )
+                k_base = k_ptr + physical_page * stride_kt + kv_head_id * stride_kh + page_offset * stride_kp
+                v_base = v_ptr + physical_page * stride_vt + kv_head_id * stride_vh + page_offset * stride_vp
+                k_token_stride, v_token_stride = stride_kp, stride_vp
             else:
-                k_token = (k_start + safe_n).to(tl.int64)
-                k_ptrs = k_ptr + k_token[:, None] * stride_kt + kv_head_id * stride_kh + offs_d[None, :] * stride_kd
-                v_ptrs = v_ptr + k_token[:, None] * stride_vt + kv_head_id * stride_vh + offs_d[None, :] * stride_vd
+                k_token = (k_start + kv_block_id * BLOCK_N).to(tl.int64)
+                k_base = k_ptr + k_token * stride_kt + kv_head_id * stride_kh
+                v_base = v_ptr + k_token * stride_vt + kv_head_id * stride_vh
+                k_token_stride, v_token_stride = stride_kt, stride_vt
+
+            k_block = tl.make_block_ptr(
+                base=k_base,
+                shape=(tl.minimum(BLOCK_N, kv_len - kv_block_id * BLOCK_N), HEAD_DIM),
+                strides=(k_token_stride, stride_kd),
+                offsets=(0, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0),
+            )
+            v_block = tl.make_block_ptr(
+                base=v_base,
+                shape=(tl.minimum(BLOCK_N, kv_len - kv_block_id * BLOCK_N), HEAD_DIM),
+                strides=(v_token_stride, stride_vd),
+                offsets=(0, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0),
+            )
 
             kv_mask = valid_n[:, None] & (offs_d[None, :] < HEAD_DIM)
-            k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
-            v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+            k = tl.load(k_block, boundary_check=(0, 1), padding_option="zero")
+            # On Ascend, block-pointer padding alone does not keep dummy QK
+            # columns zero through dot lowering. The finite mask needs them.
+            k = tl.where(kv_mask, k, 0.0)
+            v = tl.load(v_block, boundary_check=(0, 1), padding_option="zero")
 
             qk = tl.dot(q, tl.trans(k))
             causal_mask = valid_q[:, None] & valid_n[None, :] & (offs_m[:, None] >= offs_n[None, :])
@@ -148,7 +169,12 @@ def _attention_fwd_kernel(
             m_i = m_ij
 
         output = acc / l_i[:, None]
-        out_ptrs = out_ptr + q_token[:, None] * stride_ot + q_head_id * stride_oh + offs_d[None, :] * stride_od
+        if GROUPED_DECODE:
+            out_ptrs = (
+                out_ptr + q_start.to(tl.int64) * stride_ot + q_heads[:, None] * stride_oh + offs_d[None, :] * stride_od
+            )
+        else:
+            out_ptrs = out_ptr + q_token[:, None] * stride_ot + q_head_id * stride_oh + offs_d[None, :] * stride_od
         tl.store(
             out_ptrs,
             output.to(out_ptr.type.element_ty),
@@ -172,8 +198,7 @@ def _validate_cumulative_lengths(
     cumulative_lengths: torch.Tensor,
     *,
     device: torch.device,
-    total_tokens: int,
-) -> tuple[int, ...]:
+) -> None:
     if cumulative_lengths.device != device:
         raise ValueError(f"{name} must be on {device}, got {cumulative_lengths.device}")
     if cumulative_lengths.dtype != torch.int32:
@@ -182,12 +207,6 @@ def _validate_cumulative_lengths(
         raise ValueError(f"{name} must be a one-dimensional cumulative-length tensor")
     if cumulative_lengths.stride(0) != 1:
         raise ValueError(f"{name} must be contiguous")
-    boundaries = tuple(int(value) for value in cumulative_lengths.detach().cpu().tolist())
-    if boundaries[0] != 0 or boundaries[-1] != total_tokens:
-        raise ValueError(f"{name} must start at 0 and end at {total_tokens}, got {boundaries}")
-    if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
-        raise ValueError(f"{name} must be strictly increasing, got {boundaries}")
-    return boundaries
 
 
 def _validate_common(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -211,16 +230,20 @@ def attention_packed(
     cu_k_lens: torch.Tensor,
     softmax_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Batch-invariant packed causal attention for Qwen3 BF16/D128."""
+    """Batch-invariant packed causal self-attention for Qwen3 BF16/D128.
+
+    The caller supplies matching, strictly increasing cumulative lengths.
+    Metadata contents stay on device so this path supports graph replay.
+    """
 
     _validate_common(q, k, v)
     _validate_tnd("k", k)
     _validate_tnd("v", v)
     if k.shape[0] != v.shape[0]:
         raise ValueError("k and v must have the same token count")
-    q_boundaries = _validate_cumulative_lengths("cu_q_lens", cu_q_lens, device=q.device, total_tokens=q.shape[0])
-    k_boundaries = _validate_cumulative_lengths("cu_k_lens", cu_k_lens, device=q.device, total_tokens=k.shape[0])
-    if q_boundaries != k_boundaries:
+    _validate_cumulative_lengths("cu_q_lens", cu_q_lens, device=q.device)
+    _validate_cumulative_lengths("cu_k_lens", cu_k_lens, device=q.device)
+    if cu_q_lens.shape != cu_k_lens.shape or q.shape[0] != k.shape[0]:
         raise NotImplementedError("The initial kernel supports causal self-attention only")
 
     scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
@@ -273,8 +296,14 @@ def attention_paged(
     seq_lens: torch.Tensor,
     block_tables: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    *,
+    grouped_decode: bool = False,
 ) -> torch.Tensor:
-    """Batch-invariant paged causal attention sharing the packed arithmetic."""
+    """Batch-invariant paged causal attention sharing the packed arithmetic.
+
+    The caller validates cumulative/query lengths and active physical pages
+    before capture; replay reads their updated contents directly on device.
+    """
 
     require_deterministic_mode()
     _validate_tnd("q", q)
@@ -310,22 +339,12 @@ def attention_paged(
         raise ValueError("cu_q_lens, seq_lens, and block_tables must describe the same batch")
     if seq_lens.stride(0) != 1:
         raise ValueError("seq_lens must be contiguous")
-    q_boundaries = _validate_cumulative_lengths("cu_q_lens", cu_q_lens, device=q.device, total_tokens=q.shape[0])
-    sequence_lengths = tuple(int(value) for value in seq_lens.detach().cpu().tolist())
-    query_lengths = tuple(end - start for start, end in zip(q_boundaries, q_boundaries[1:]))
-    if any(q_len > kv_len or kv_len <= 0 for q_len, kv_len in zip(query_lengths, sequence_lengths)):
-        raise ValueError("Each query length must be positive and no greater than its KV length")
-    pages_needed = tuple((length + _PAGE_SIZE - 1) // _PAGE_SIZE for length in sequence_lengths)
-    if any(count > block_tables.shape[1] for count in pages_needed):
-        raise ValueError("block_tables does not contain enough logical pages")
-    active_pages = block_tables.detach().cpu()
-    for batch_id, count in enumerate(pages_needed):
-        pages = active_pages[batch_id, :count]
-        if bool(((pages < 0) | (pages >= key_cache.shape[0])).any().item()):
-            raise ValueError("block_tables contains an invalid physical page")
+    _validate_cumulative_lengths("cu_q_lens", cu_q_lens, device=q.device)
 
     scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
     output = torch.empty_like(q)
+    # Small-batch decode packs only independent heads; KV reductions stay fixed.
+    block_m = 16 if grouped_decode and batch_size <= 2 and q.shape[1] // key_cache.shape[1] <= 16 else _BLOCK_M
     _attention_fwd_kernel[(batch_size, get_num_cores("cube"))](
         q,
         key_cache,
@@ -357,9 +376,10 @@ def attention_paged(
         _HEAD_DIM,
         _PAGE_SIZE,
         PAGED=True,
-        BLOCK_M=_BLOCK_M,
+        BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_D=_HEAD_DIM,
+        GROUPED_DECODE=grouped_decode,
         multibuffer=False,
     )
     return output
@@ -433,7 +453,16 @@ def paged_decode_gqa_infer_fwd(
 ):
     _validate_attention(is_causal, gqa_layout, mask)
     cumulative = torch.arange(query.shape[0] + 1, dtype=torch.int32, device=query.device)
-    return attention_paged(query, key_cache, value_cache, cumulative, total_seq_lens, block_tables, softmax_scale)
+    return attention_paged(
+        query,
+        key_cache,
+        value_cache,
+        cumulative,
+        total_seq_lens,
+        block_tables,
+        softmax_scale,
+        grouped_decode=True,
+    )
 
 
 __all__ = [
